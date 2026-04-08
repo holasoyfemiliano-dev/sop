@@ -63,10 +63,13 @@ export async function GET(req: NextRequest) {
       }
     );
 
-    // Clear state cookie
+    // Clear state/from cookies and redirect
+    const from = cookieStore.get("gcal_from")?.value ?? "settings";
     cookieStore.delete("gcal_state");
+    cookieStore.delete("gcal_from");
 
-    return NextResponse.redirect(new URL("/settings?gcal=connected", req.url));
+    const dest = from === "onboarding" ? "/onboarding?connected=true" : "/settings?gcal=connected";
+    return NextResponse.redirect(new URL(dest, req.url));
   } catch (err) {
     console.error("[gcal/callback]", err);
     return NextResponse.redirect(new URL("/settings?gcal=token_error", req.url));

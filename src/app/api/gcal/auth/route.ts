@@ -1,9 +1,9 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { google } from "googleapis";
 import crypto from "crypto";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
   const redirectUri = process.env.GOOGLE_REDIRECT_URI ?? "http://localhost:3000/api/gcal/callback";
@@ -25,6 +25,16 @@ export async function GET() {
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
     maxAge: 600, // 10 min
+    path: "/",
+  });
+
+  // Store where to redirect after OAuth completes
+  const from = new URL(req.url).searchParams.get("from") ?? "settings";
+  cookieStore.set("gcal_from", from, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 600,
     path: "/",
   });
 

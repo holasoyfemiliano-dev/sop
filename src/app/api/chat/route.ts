@@ -1,74 +1,83 @@
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const SYSTEM_PROMPT = (date: string, time: string) => `
-Eres el asistente de SOP (Sistema Operativo Personal). Hablas en español.
+Eres el asistente de SOP — un sistema operativo personal. Hablas en español.
 Hoy es ${date}. Hora actual: ${time}.
 
-Cuando el usuario describe tareas, objetivos, ideas o pendientes, extrae la información
-y responde con un JSON válido con esta estructura exacta:
+SOP organiza tareas en un Kanban con estas columnas:
+- backlog: Bodega (ideas sin priorizar)
+- todo: Por hacer (definidas, no urgentes hoy)
+- in_progress: En proceso (multi-día o en curso)
+- today: 3 de hoy (máximo 3, foco del día)
+- done: Hecho
+
+Responde SIEMPRE con JSON válido (sin markdown):
 
 {
-  "reply": "Respuesta conversacional amigable y motivadora (máx 2 oraciones)",
-  "tasks": [
-    {
-      "title": "Título concreto y accionable",
-      "description": "Descripción opcional",
-      "category": "negocio|salud|aprendizaje|relaciones|finanzas|personal",
-      "priority": "alta|media|baja",
-      "eisenhower": "do_first|schedule|delegate|eliminate",
-      "urgent": true|false,
-      "important": true|false,
-      "status": "pending",
-      "frequency": "once|diario|semanal|mensual",
-      "estimatedMinutes": 30,
-      "hasLocation": false,
-      "location": null,
-      "travelMinutesBefore": null,
-      "scheduledDate": null,
-      "preferredHour": null,
-      "source": "chat"
-    }
-  ],
-  "subtasks": {
-    "0": [
-      { "title": "Subtarea 1", "estimatedMinutes": 10, "completed": false, "order": 0 },
-      { "title": "Subtarea 2", "estimatedMinutes": 20, "completed": false, "order": 1 }
-    ]
-  }
+  "reply": "Respuesta breve y amigable (máx 2 oraciones)",
+  "action": "add" | "delete" | "none",
+  "tasks": [...],
+  "deleteQuery": null
 }
 
-Reglas importantes:
-- Si el usuario menciona un lugar físico (gimnasio, oficina, reunión), hasLocation = true y estima travelMinutesBefore
-- urgent = true solo si debe hacerse hoy o en las próximas 48h
-- important = true si avanza hacia un objetivo significativo
-- eisenhower: do_first(urgente+importante), schedule(no urgente+importante), delegate(urgente+no importante), eliminate(no urgente+no importante)
-- Si la tarea dura más de 60 min, divide en subtareas en "subtasks.0" (o "subtasks.1" para la segunda tarea, etc.)
-- frequency "diario" solo si el usuario dice explícitamente que es recurrente diario
-- Si el usuario hace una pregunta simple o conversa, responde en "reply" y deja "tasks" vacío []
-- scheduledDate: "YYYY-MM-DD" solo si el usuario especifica una fecha. Si dice "hoy" usa ${date}.
-- preferredHour: número 0-23 si menciona una hora. Ejemplo "a las 9am" → 9
+── CUANDO action = "add" ──
+Llena "tasks" con la tarea a crear:
+{
+  "title": "Título claro de la tarea",
+  "status": "backlog" | "todo" | "in_progress" | "today",
+  "priority": "low" | "medium" | "high" | "critical",
+  "urgency": "low" | "medium" | "high",
+  "importance": "low" | "medium" | "high",
+  "scheduledDate": "YYYY-MM-DD o null",
+  "scheduledStart": "HH:MM o null",
+  "scheduledEnd": "HH:MM o null",
+  "estimatedMinutes": número o null,
+  "dueDate": "YYYY-MM-DD o null",
+  "notes": null
+}
 
-IMPORTANTE: Tu respuesta debe ser SOLO el JSON, sin texto antes ni después, sin markdown.
+Reglas para status:
+- Si menciona "hoy" y es urgente/importante → "today" (pero recuerda que hay límite de 3)
+- Si tiene fecha específica pero no urgente → "todo"
+- Si menciona multi-día, semanas, proyectos largos → "in_progress"
+- Sin fecha ni urgencia clara → "backlog"
+
+Reglas para scheduledDate:
+- "hoy" → ${date}
+- "mañana" → calcula la fecha de mañana
+- "el lunes/martes/..." → calcula el próximo día de semana
+- Fecha específica mencionada → usa esa fecha
+
+Reglas para scheduledStart/scheduledEnd:
+- Si menciona hora: "3pm" → "15:00", "9am" → "09:00", "7:30pm" → "19:30"
+- Si menciona duración: calcula scheduledEnd = scheduledStart + duración
+- Si no menciona hora → null
+
+── CUANDO action = "delete" ──
+Deja "tasks" vacío [].
+Llena "deleteQuery" con las palabras clave del evento a borrar.
+Ejemplo: "quita el gym de hoy" → deleteQuery: "gym"
+Ejemplo: "borra la reunión del lunes" → deleteQuery: "reunión"
+
+── CUANDO action = "none" ──
+Solo responde en "reply". Deja tasks vacío y deleteQuery null.
+
+IMPORTANTE: Solo JSON válido, sin texto extra ni markdown.
 `.trim();
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { message, history = [], currentDate, currentTime } = body;
+    const { message, history = [], currentDate, currentTime } = await req.json();
 
     if (!message?.trim()) {
       return NextResponse.json({ error: "Message required" }, { status: 400 });
     }
 
-    // Build conversation history (last 10 messages)
-    const recentHistory = history.slice(-10);
     const messages: Anthropic.MessageParam[] = [
-      ...recentHistory.map((m: { role: string; content: string }) => ({
+      ...history.slice(-10).map((m: { role: string; content: string }) => ({
         role: m.role as "user" | "assistant",
         content: m.content,
       })),
@@ -77,7 +86,7 @@ export async function POST(req: NextRequest) {
 
     const response = await anthropic.messages.create({
       model: "claude-opus-4-5",
-      max_tokens: 2048,
+      max_tokens: 1024,
       system: SYSTEM_PROMPT(currentDate, currentTime),
       messages,
     });
@@ -86,31 +95,26 @@ export async function POST(req: NextRequest) {
 
     let parsed: {
       reply: string;
-      tasks: unknown[];
-      subtasks: Record<string, unknown[]>;
+      action?: string;
+      tasks?: unknown[];
+      deleteQuery?: string | null;
     };
 
     try {
-      // Strip markdown code fences if present
       const clean = rawText.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
       parsed = JSON.parse(clean);
     } catch {
-      // If parsing fails, return as a plain reply
-      parsed = { reply: rawText, tasks: [], subtasks: {} };
+      parsed = { reply: rawText, action: "none", tasks: [] };
     }
 
     return NextResponse.json({
       reply: parsed.reply ?? "",
-      parsedTasks: {
-        tasks: parsed.tasks ?? [],
-        subtasks: parsed.subtasks ?? {},
-      },
+      action: parsed.action ?? "none",
+      deleteQuery: parsed.deleteQuery ?? null,
+      tasks: parsed.tasks ?? [],
     });
   } catch (err) {
     console.error("[chat/route]", err);
-    return NextResponse.json(
-      { error: "Error processing message" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Error processing message" }, { status: 500 });
   }
 }

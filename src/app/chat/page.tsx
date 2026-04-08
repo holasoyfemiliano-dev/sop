@@ -2,27 +2,36 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import Nav from "@/components/Nav";
 import { loadState, saveState, generateId, getTodayStr } from "@/lib/store";
-import { scheduleDayTasks } from "@/lib/scheduler";
-import type { SOPState, ChatMessage, Task, Subtask, ParsedTaskOutput, TimeBlock } from "@/lib/types";
+import type { SOPState, ChatMessage, Task, TaskStatus } from "@/lib/types";
 import { Send, Loader2, Calendar, MessageSquare } from "lucide-react";
 
 // ── GCal sync ─────────────────────────────────────────────────────────────────
 
-async function pushBlocksToGCal(blocks: TimeBlock[]): Promise<Map<string, string>> {
-  const gcalIds = new Map<string, string>();
+async function syncTaskToGCal(task: Task): Promise<string | null> {
+  if (!task.scheduledDate || !task.scheduledStart) return null;
   try {
-    const res = await fetch("/api/gcal/sync", {
+    const res = await fetch("/api/gcal/sync-task", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ blocks, calendarId: "primary" }),
+      body: JSON.stringify({
+        taskId: task.id,
+        title: task.title,
+        scheduledDate: task.scheduledDate,
+        scheduledStart: task.scheduledStart,
+        scheduledEnd: task.scheduledEnd ?? addMinutes(task.scheduledStart, task.estimatedMinutes ?? 60),
+        gcalEventId: task.gcalEventId,
+      }),
     });
-    if (!res.ok) return gcalIds;
+    if (!res.ok) return null;
     const data = await res.json();
-    for (const r of data.results ?? []) {
-      if (r.gcalEventId) gcalIds.set(r.blockId, r.gcalEventId);
-    }
-  } catch { /* silent */ }
-  return gcalIds;
+    return data.gcalEventId ?? null;
+  } catch { return null; }
+}
+
+function addMinutes(time: string, mins: number): string {
+  const [h, m] = time.split(":").map(Number);
+  const total = h * 60 + m + mins;
+  return `${String(Math.floor(total / 60) % 24).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
 }
 
 async function deleteFromGCal(gcalEventId: string) {
@@ -53,6 +62,24 @@ function Toast({ msg, type }: { msg: string; type: "success" | "error" }) {
   );
 }
 
+// ── Parsed task from API ──────────────────────────────────────────────────────
+
+interface ParsedTaskFromAPI {
+  title: string;
+  status?: TaskStatus;
+  priority?: Task["priority"];
+  urgency?: Task["urgency"];
+  importance?: Task["importance"];
+  scheduledDate?: string;
+  scheduledStart?: string;
+  scheduledEnd?: string;
+  estimatedMinutes?: number;
+  dueDate?: string;
+  notes?: string;
+}
+
+// ── Main Page ─────────────────────────────────────────────────────────────────
+
 export default function ChatPage() {
   const [state, setState] = useState<SOPState | null>(null);
   const [input, setInput] = useState("");
@@ -67,10 +94,7 @@ export default function ChatPage() {
   useEffect(() => {
     if (!state || autoSentRef.current) return;
     const q = new URLSearchParams(window.location.search).get("q");
-    if (q) {
-      autoSentRef.current = true;
-      setInput(q);
-    }
+    if (q) { autoSentRef.current = true; setInput(q); }
   }, [state]);
 
   useEffect(() => {
@@ -84,66 +108,56 @@ export default function ChatPage() {
 
   const update = useCallback((s: SOPState) => { setState(s); saveState(s); }, []);
 
-  // ── Auto-create event from parsed task (no confirmation) ─────────────────
-  const autoCreateEvents = useCallback(
-    async (parsedTasks: ParsedTaskOutput, currentState: SOPState): Promise<SOPState> => {
+  // ── Create tasks from chat response ───────────────────────────────────────
+  const createTasks = useCallback(
+    async (parsedTasks: ParsedTaskFromAPI[], currentState: SOPState): Promise<SOPState> => {
       const today = getTodayStr();
       let st = currentState;
-      const allNewBlocks: TimeBlock[] = [];
+      const todayCount = st.tasks.filter((t) => t.status === "today").length;
+      let todayAdded = 0;
 
-      for (const taskData of parsedTasks.tasks) {
+      for (const taskData of parsedTasks) {
         const taskId = generateId();
         const now = new Date().toISOString();
 
+        // Determine status
+        let status: TaskStatus = taskData.status ?? "todo";
+        if (status === "today" && todayCount + todayAdded >= 3) {
+          status = "todo"; // overflow to "por hacer"
+        }
+        if (status === "today") todayAdded++;
+
         const newTask: Task = {
-          ...taskData,
           id: taskId,
-          scheduledDate: taskData.scheduledDate ?? today,
-          missCount: 0,
-          gcalSyncStatus: "not_synced",
+          title: taskData.title,
+          status,
+          priority: taskData.priority ?? "medium",
+          urgency: taskData.urgency ?? "medium",
+          importance: taskData.importance ?? "medium",
+          scheduledDate: taskData.scheduledDate,
+          scheduledStart: taskData.scheduledStart,
+          scheduledEnd: taskData.scheduledEnd,
+          estimatedMinutes: taskData.estimatedMinutes,
+          dueDate: taskData.dueDate,
+          notes: taskData.notes,
+          source: "chat",
           createdAt: now,
           updatedAt: now,
-        } as Task;
-
-        const newSubtasks: Subtask[] = (parsedTasks.subtasks?.[String(parsedTasks.tasks.indexOf(taskData))] ?? []).map(
-          (s, i) => ({ ...s, id: generateId(), taskId, order: i })
-        );
-
-        const targetDate = newTask.scheduledDate ?? today;
-        const existing = st.timeBlocks.filter((b) => b.date === targetDate);
-        const { blocks } = scheduleDayTasks({
-          tasks: [newTask],
-          date: targetDate,
-          preferences: st.preferences,
-          existingBlocks: existing,
-        });
-
-        const blocksWithIds: TimeBlock[] = blocks.map((b) => ({ ...b, id: generateId() }));
-        allNewBlocks.push(...blocksWithIds);
-
-        st = {
-          ...st,
-          tasks: [...st.tasks, newTask],
-          subtasks: [...st.subtasks, ...newSubtasks],
-          timeBlocks: [...st.timeBlocks, ...blocksWithIds],
         };
-      }
 
-      update(st);
+        st = { ...st, tasks: [newTask, ...st.tasks] };
+        update(st);
 
-      // Push all new blocks to GCal
-      if (allNewBlocks.length > 0) {
-        const gcalIds = await pushBlocksToGCal(allNewBlocks);
-        if (gcalIds.size > 0) {
-          const synced = {
-            ...st,
-            timeBlocks: st.timeBlocks.map((b) => {
-              const gid = gcalIds.get(b.id);
-              return gid ? { ...b, gcalEventId: gid, gcalSyncStatus: "synced" as const } : b;
-            }),
-          };
-          update(synced);
-          return synced;
+        // GCal sync
+        if (newTask.scheduledDate && newTask.scheduledStart) {
+          const gcalEventId = await syncTaskToGCal(newTask);
+          if (gcalEventId) {
+            st = {
+              ...st,
+              tasks: st.tasks.map((t) => t.id === taskId ? { ...t, gcalEventId } : t),
+            };
+            update(st);
+          }
         }
       }
 
@@ -152,26 +166,24 @@ export default function ChatPage() {
     [update]
   );
 
-  // ── Handle deletion ──────────────────────────────────────────────────────
-  const handleDeleteQuery = useCallback(
-    async (query: string, currentState: SOPState): Promise<SOPState> => {
-      const words = query.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
-      const matching = currentState.timeBlocks.filter((b) =>
-        words.some((w) => b.title.toLowerCase().includes(w))
+  // ── Delete tasks from chat response ──────────────────────────────────────
+  const deleteTasks = useCallback(
+    async (deleteQuery: string, currentState: SOPState): Promise<SOPState> => {
+      const words = deleteQuery.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
+      const matching = currentState.tasks.filter((t) =>
+        words.some((w) => t.title.toLowerCase().includes(w))
       );
       if (matching.length === 0) return currentState;
 
-      for (const block of matching) {
-        if (block.gcalEventId) await deleteFromGCal(block.gcalEventId);
+      for (const task of matching) {
+        if (task.gcalEventId) await deleteFromGCal(task.gcalEventId);
       }
 
-      const deletedIds = new Set(matching.map((b) => b.id));
-      const deletedTaskIds = new Set(matching.map((b) => b.taskId).filter(Boolean) as string[]);
-
+      const deletedIds = new Set(matching.map((t) => t.id));
       return {
         ...currentState,
-        timeBlocks: currentState.timeBlocks.filter((b) => !deletedIds.has(b.id)),
-        tasks: currentState.tasks.filter((t) => !deletedTaskIds.has(t.id)),
+        tasks: currentState.tasks.filter((t) => !deletedIds.has(t.id)),
+        steps: currentState.steps.filter((s) => !deletedIds.has(s.taskId)),
       };
     },
     []
@@ -205,24 +217,19 @@ export default function ChatPage() {
       });
 
       const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error ?? "Error del servidor");
 
-      if (!res.ok || data.error) {
-        throw new Error(data.error ?? "Error del servidor");
-      }
+      const { reply, action, deleteQuery, tasks } = data;
+      const replyText = reply || (action === "add" ? "Listo, lo agregué." : "Hecho.");
 
-      const { reply, action, deleteQuery, parsedTasks } = data;
-      const replyText = reply || (action === "add" ? "Listo, lo agregué a tu calendario." : "Hecho.");
-
-      // ── Handle deletion ──────────────────────────────────────────────
       if (action === "delete" && deleteQuery) {
-        currentState = await handleDeleteQuery(deleteQuery, currentState);
-        showToast("Evento eliminado del calendario", "success");
+        currentState = await deleteTasks(deleteQuery, currentState);
+        showToast("Tarea eliminada", "success");
       }
 
-      // ── Auto-create events ───────────────────────────────────────────
-      if (action === "add" && parsedTasks?.tasks?.length > 0) {
-        currentState = await autoCreateEvents(parsedTasks, currentState);
-        showToast("Evento agregado al calendario ✓", "success");
+      if (action === "add" && tasks?.length > 0) {
+        currentState = await createTasks(tasks, currentState);
+        showToast("Tarea agregada al sistema ✓", "success");
       }
 
       const assistantMsg: ChatMessage = {
@@ -234,7 +241,7 @@ export default function ChatPage() {
 
     } catch (err) {
       const msg = err instanceof Error && err.message.includes("API")
-        ? "Falta configurar la API key de Claude. Agrega ANTHROPIC_API_KEY en Vercel."
+        ? "Falta configurar la API key de Claude."
         : "Error al procesar. Intenta de nuevo.";
       const errMsg: ChatMessage = {
         id: generateId(), role: "assistant", content: msg,
@@ -254,9 +261,9 @@ export default function ChatPage() {
   if (!state) return null;
 
   const STARTERS = [
-    "Agrega reunión de equipo mañana a las 10am, 1 hora",
-    "Pon gym esta tarde a las 7pm",
-    "Agrega almuerzo con cliente el viernes a las 1pm",
+    "Pon gym hoy a las 7pm, 1 hora",
+    "Agrega reunión de equipo mañana a las 10am",
+    "Crear tarea 'preparar presentación' para el viernes",
     "Quita la reunión de las 3pm de hoy",
   ];
 
@@ -277,16 +284,16 @@ export default function ChatPage() {
               >
                 <MessageSquare size={26} style={{ color: "#230EFF" }} />
               </div>
-              <h2 className="text-xl font-bold mb-2" style={{ color: "#EAEBEF" }}>¿Qué quieres agendar?</h2>
+              <h2 className="text-xl font-bold mb-2" style={{ color: "#EAEBEF" }}>¿Qué quieres hacer?</h2>
               <p className="text-sm mb-7 max-w-xs mx-auto" style={{ color: "#818BA6" }}>
-                Dime qué agregar o quitar y lo sincronizo con Google Calendar.
+                Dime qué agregar o quitar. Lo organizo en tu sistema y lo sincronizo con Google Calendar.
               </p>
               <div className="space-y-2 max-w-sm mx-auto text-left">
                 {STARTERS.map((p) => (
                   <button
                     key={p}
                     onClick={() => setInput(p)}
-                    className="w-full text-left text-sm px-4 py-3 rounded-xl transition-all hover:border-opacity-50"
+                    className="w-full text-left text-sm px-4 py-3 rounded-xl transition-all"
                     style={{
                       background: "rgba(13,16,53,0.8)",
                       border: "1px solid rgba(35,14,255,0.2)",
@@ -320,8 +327,7 @@ export default function ChatPage() {
                   <div
                     className="rounded-2xl px-4 py-2.5 text-sm leading-relaxed"
                     style={isUser ? {
-                      background: "#230EFF",
-                      color: "#EAEBEF",
+                      background: "#230EFF", color: "#EAEBEF",
                       borderRadius: "16px 16px 4px 16px",
                     } : {
                       background: "rgba(13,16,53,0.9)",
@@ -332,9 +338,7 @@ export default function ChatPage() {
                   >
                     {msg.content}
                   </div>
-
-                  {/* GCal sync indicator */}
-                  {!isUser && msg.content.includes("calendario") && (
+                  {!isUser && (msg.content.includes("calendario") || msg.content.includes("Calendar")) && (
                     <div className="flex items-center gap-1.5 mt-1.5 px-1">
                       <Calendar size={11} style={{ color: "#230EFF" }} />
                       <span className="text-xs" style={{ color: "#3D4466" }}>Sincronizado con Google Calendar</span>
@@ -345,7 +349,6 @@ export default function ChatPage() {
             );
           })}
 
-          {/* Loading */}
           {loading && (
             <div className="flex justify-start">
               <div
@@ -369,7 +372,7 @@ export default function ChatPage() {
             ref={inputRef}
             className="flex-1 bg-transparent text-sm resize-none focus:outline-none max-h-32 min-h-[40px]"
             style={{ color: "#EAEBEF" }}
-            placeholder="Agregar o quitar del calendario…"
+            placeholder="Agregar, mover o quitar tareas…"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}

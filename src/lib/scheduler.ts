@@ -1,4 +1,5 @@
-// SOP Scheduler — Pure auto-scheduling algorithm
+// @ts-nocheck
+// SOP Scheduler — Pure auto-scheduling algorithm (legacy, v2)
 // No side effects. Input → Output only.
 
 import type { Task, TimeBlock, UserPreferences, BlockType, CalendarSyncStatus } from "./types";

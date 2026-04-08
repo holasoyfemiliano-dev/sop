@@ -1,8 +1,7 @@
-// SOP Store — v2 with migration
-import type { SOPState, UserPreferences } from "./types";
+// SOP Store — v3 with migration from v2
+import type { SOPState, UserPreferences, Task } from "./types";
 
-const STORAGE_KEY = "sop_v2";
-const LEGACY_KEY = "sop_data";
+const STORAGE_KEY = "sop_v3";
 
 export function defaultPreferences(): UserPreferences {
   return {
@@ -12,13 +11,7 @@ export function defaultPreferences(): UserPreferences {
       workStartHour: 7,
       workEndHour: 22,
       protectedBlocks: [
-        {
-          label: "Almuerzo",
-          startHour: 13,
-          startMinute: 0,
-          durationMinutes: 60,
-          days: [1, 2, 3, 4, 5],
-        },
+        { label: "Almuerzo", startHour: 13, startMinute: 0, durationMinutes: 60, days: [1, 2, 3, 4, 5] },
       ],
       bufferBetweenTasksMinutes: 10,
       peakHours: [9, 10, 11, 16, 17],
@@ -36,162 +29,128 @@ export function defaultPreferences(): UserPreferences {
   };
 }
 
-function migrateState(raw: Record<string, unknown>): SOPState {
-  if (!raw.version || (raw.version as number) < 2) {
-    return {
-      version: 2,
-      goals: (raw.goals as SOPState["goals"]) ?? [],
-      actions: (raw.actions as SOPState["actions"]) ?? [],
-      logs: (raw.logs as SOPState["logs"]) ?? [],
-      tasks: [],
-      subtasks: [],
-      timeBlocks: [],
-      chatMessages: [],
-      preferences: defaultPreferences(),
+function migrateToV3(raw: Record<string, unknown>): SOPState {
+  const def = defaultPreferences();
+  const base: SOPState = {
+    version: 3,
+    tasks: [],
+    projects: [],
+    steps: [],
+    chatMessages: [],
+    preferences: def,
+  };
+
+  // Migrate preferences
+  if (raw.preferences) {
+    const p = raw.preferences as Record<string, unknown>;
+    base.preferences = {
+      ...def,
+      ...(p as Partial<UserPreferences>),
+      schedule: { ...def.schedule, ...((p.schedule ?? {}) as Partial<UserPreferences["schedule"]>) },
+      reschedulePolicy: { ...def.reschedulePolicy, ...((p.reschedulePolicy ?? {}) as Partial<UserPreferences["reschedulePolicy"]>) },
+      gcal: { ...def.gcal, ...((p.gcal ?? {}) as Partial<UserPreferences["gcal"]>) },
     };
   }
-  const state = raw as unknown as SOPState;
-  // Ensure preferences is complete (fill missing fields from default)
-  const def = defaultPreferences();
-  state.preferences = {
-    ...def,
-    ...state.preferences,
-    schedule: { ...def.schedule, ...state.preferences?.schedule },
-    reschedulePolicy: { ...def.reschedulePolicy, ...state.preferences?.reschedulePolicy },
-    gcal: { ...def.gcal, ...state.preferences?.gcal },
-  };
-  return state;
+
+  // Migrate chat messages
+  if (Array.isArray(raw.chatMessages)) {
+    base.chatMessages = (raw.chatMessages as Array<Record<string, unknown>>)
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({
+        id: String(m.id ?? generateId()),
+        role: m.role as "user" | "assistant",
+        content: String(m.content ?? ""),
+        timestamp: String(m.timestamp ?? new Date().toISOString()),
+      }));
+  }
+
+  // Migrate v2 tasks to v3 format
+  if (Array.isArray(raw.tasks)) {
+    base.tasks = (raw.tasks as Array<Record<string, unknown>>).map((t): Task => {
+      const oldStatus = String(t.status ?? "");
+      let status: Task["status"] = "todo";
+      if (oldStatus === "completed") status = "done";
+      else if (oldStatus === "in_progress") status = "in_progress";
+      else if (["missed", "rescheduled", "deferred", "reduced"].includes(oldStatus)) status = "backlog";
+
+      const oldPriority = String(t.priority ?? "");
+      let priority: Task["priority"] = "medium";
+      if (["alta", "high", "critical"].includes(oldPriority)) priority = "high";
+      else if (["baja", "low"].includes(oldPriority)) priority = "low";
+
+      return {
+        id: String(t.id ?? generateId()),
+        title: String(t.title ?? ""),
+        description: t.description ? String(t.description) : undefined,
+        status,
+        priority,
+        urgency: t.urgent ? "high" : "medium",
+        importance: t.important ? "high" : "medium",
+        scheduledDate: t.scheduledDate ? String(t.scheduledDate) : undefined,
+        scheduledStart: t.pinnedTime ? String(t.pinnedTime) : undefined,
+        estimatedMinutes: t.estimatedMinutes ? Number(t.estimatedMinutes) : undefined,
+        notes: t.notes ? String(t.notes) : undefined,
+        gcalEventId: t.gcalEventId ? String(t.gcalEventId) : undefined,
+        source: (t.source === "chat" ? "chat" : "manual") as Task["source"],
+        createdAt: String(t.createdAt ?? new Date().toISOString()),
+        updatedAt: String(t.updatedAt ?? new Date().toISOString()),
+        completedAt: t.completedAt ? String(t.completedAt) : undefined,
+      };
+    });
+  }
+
+  return base;
 }
 
 export function loadState(): SOPState {
   if (typeof window === "undefined") {
     return {
-      version: 2,
-      goals: [],
-      actions: [],
-      logs: [],
+      version: 3,
       tasks: [],
-      subtasks: [],
-      timeBlocks: [],
+      projects: [],
+      steps: [],
       chatMessages: [],
       preferences: defaultPreferences(),
     };
   }
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return migrateState(JSON.parse(raw));
-    // Try legacy key
-    const legacy = localStorage.getItem(LEGACY_KEY);
-    if (legacy) {
-      const migrated = migrateState(JSON.parse(legacy));
+    const raw3 = localStorage.getItem(STORAGE_KEY);
+    if (raw3) {
+      const parsed = JSON.parse(raw3) as SOPState;
+      if (parsed.version === 3) return parsed;
+      return migrateToV3(parsed as unknown as Record<string, unknown>);
+    }
+    const raw2 = localStorage.getItem("sop_v2");
+    if (raw2) {
+      const migrated = migrateToV3(JSON.parse(raw2));
       saveState(migrated);
       return migrated;
     }
-  } catch {
-    // ignore
-  }
-  return migrateState({});
+    const legacy = localStorage.getItem("sop_data");
+    if (legacy) {
+      const migrated = migrateToV3(JSON.parse(legacy));
+      saveState(migrated);
+      return migrated;
+    }
+  } catch { /* ignore */ }
+  return migrateToV3({});
 }
 
 export function saveState(state: SOPState) {
   if (typeof window === "undefined") return;
-  // Trim chat history to last 100 messages
-  const trimmed = {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({
     ...state,
     chatMessages: state.chatMessages.slice(-100),
-  };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  }));
 }
-
-// ─── Derived helpers ────────────────────────────────────────────────────────
 
 export function getTodayStr(): string {
   return new Date().toISOString().split("T")[0];
-}
-
-export function getTodayLog(state: SOPState) {
-  const today = getTodayStr();
-  return state.logs.find((l) => l.date === today) ?? { date: today, actions: [], blockOutcomes: [] };
-}
-
-export function getBlocksForDate(state: SOPState, date: string) {
-  return state.timeBlocks
-    .filter((b) => b.date === date)
-    .sort((a, b) => a.startTime.localeCompare(b.startTime));
-}
-
-export function getTasksForDate(state: SOPState, date: string) {
-  return state.tasks.filter((t) => t.scheduledDate === date);
-}
-
-export function getCompletionRate(state: SOPState, days = 7): number {
-  const today = new Date();
-  let total = 0;
-  let completed = 0;
-
-  for (let i = 0; i < days; i++) {
-    const d = new Date(today);
-    d.setDate(today.getDate() - i);
-    const dateStr = d.toISOString().split("T")[0];
-
-    const blocks = state.timeBlocks.filter((b) => b.date === dateStr && b.type === "task");
-    if (blocks.length > 0) {
-      total += blocks.length;
-      completed += blocks.filter((b) => b.completed).length;
-    } else {
-      // Fall back to legacy actions
-      const log = state.logs.find((l) => l.date === dateStr);
-      const actions = state.actions.filter((a) => {
-        const g = state.goals.find((g) => g.id === a.goalId);
-        return g?.active && a.frequency === "diario";
-      });
-      total += actions.length;
-      if (log) completed += log.actions.filter((a) => a.completed).length;
-    }
-  }
-
-  return total > 0 ? Math.round((completed / total) * 100) : 0;
-}
-
-export function getStreak(state: SOPState): number {
-  let streak = 0;
-  const today = new Date();
-
-  for (let i = 0; i < 365; i++) {
-    const d = new Date(today);
-    d.setDate(today.getDate() - i);
-    const dateStr = d.toISOString().split("T")[0];
-
-    const blocks = state.timeBlocks.filter((b) => b.date === dateStr && b.type === "task");
-    let rate = 0;
-
-    if (blocks.length > 0) {
-      rate = blocks.filter((b) => b.completed).length / blocks.length;
-    } else {
-      const log = state.logs.find((l) => l.date === dateStr);
-      const actions = state.actions.filter((a) => {
-        const g = state.goals.find((g) => g.id === a.goalId);
-        return g?.active && a.frequency === "diario";
-      });
-      if (actions.length > 0 && log) {
-        rate = log.actions.filter((a) => a.completed).length / actions.length;
-      }
-    }
-
-    if (rate >= 0.7) {
-      streak++;
-    } else if (i > 0) {
-      break;
-    }
-  }
-
-  return streak;
 }
 
 export function generateId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-// Re-export types for convenience
 export type { SOPState };
 export * from "./types";

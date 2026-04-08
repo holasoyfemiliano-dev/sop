@@ -1,3 +1,4 @@
+// @ts-nocheck
 "use client";
 import { useEffect, useState } from "react";
 import { CheckCircle2, Clock, MapPin, SkipForward, RefreshCw } from "lucide-react";

@@ -51,15 +51,13 @@ function SettingsContent() {
 
   useEffect(() => {
     setState(loadState());
-    // Read gcal_info cookie
-    try {
-      const match = document.cookie.match(/gcal_info=([^;]+)/);
-      if (match) setGcalInfo(JSON.parse(decodeURIComponent(match[1])));
-    } catch { /* ignore */ }
-    // Check if Google is configured (try health endpoint)
-    fetch("/api/gcal/auth").then((r) => {
-      setGcalConfigured(r.status !== 503);
-    }).catch(() => {});
+    fetch("/api/gcal/status")
+      .then((r) => r.json())
+      .then((data) => {
+        setGcalConfigured(data.configured);
+        if (data.connected) setGcalInfo({ email: data.email, connected: true });
+      })
+      .catch(() => {});
   }, []);
 
   const update = useCallback(
