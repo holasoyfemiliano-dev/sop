@@ -1,144 +1,193 @@
 "use client";
-import { useEffect, useRef, useState, useCallback, Suspense } from "react";
-import { useSearchParams } from "next/navigation";
+import { useEffect, useRef, useState, useCallback } from "react";
 import Nav from "@/components/Nav";
 import { loadState, saveState, generateId, getTodayStr } from "@/lib/store";
 import { scheduleDayTasks } from "@/lib/scheduler";
-import type { SOPState, ChatMessage, Task, Subtask, ParsedTaskOutput } from "@/lib/types";
-import {
-  Send,
-  Loader2,
-  CheckCircle2,
-  X,
-  Zap,
-  Clock,
-  MapPin,
-  AlertCircle,
-} from "lucide-react";
-import { CATEGORY_LABELS, CATEGORY_COLORS, EISENHOWER_LABELS } from "@/lib/types";
+import type { SOPState, ChatMessage, Task, Subtask, ParsedTaskOutput, TimeBlock } from "@/lib/types";
+import { Send, Loader2, Calendar, MessageSquare } from "lucide-react";
 
-function PendingTaskCard({
-  task,
-  subtasks,
-  onAccept,
-  onReject,
-}: {
-  task: ParsedTaskOutput["tasks"][0];
-  subtasks: ParsedTaskOutput["subtasks"][string];
-  onAccept: () => void;
-  onReject: () => void;
-}) {
-  const eis = EISENHOWER_LABELS[task.eisenhower];
+// ── GCal sync ─────────────────────────────────────────────────────────────────
+
+async function pushBlocksToGCal(blocks: TimeBlock[]): Promise<Map<string, string>> {
+  const gcalIds = new Map<string, string>();
+  try {
+    const res = await fetch("/api/gcal/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ blocks, calendarId: "primary" }),
+    });
+    if (!res.ok) return gcalIds;
+    const data = await res.json();
+    for (const r of data.results ?? []) {
+      if (r.gcalEventId) gcalIds.set(r.blockId, r.gcalEventId);
+    }
+  } catch { /* silent */ }
+  return gcalIds;
+}
+
+async function deleteFromGCal(gcalEventId: string) {
+  try {
+    await fetch("/api/gcal/delete-event", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gcalEventId }),
+    });
+  } catch { /* silent */ }
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+
+function Toast({ msg, type }: { msg: string; type: "success" | "error" }) {
   return (
-    <div className="border border-indigo-500/30 bg-indigo-500/5 rounded-xl p-3 mt-2">
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium text-white">{task.title}</p>
-          <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
-            <span className={`text-xs px-1.5 py-0.5 rounded-full border ${CATEGORY_COLORS[task.category]}`}>
-              {CATEGORY_LABELS[task.category]}
-            </span>
-            <span className={`text-xs font-medium ${eis.color}`}>{eis.label}</span>
-            <span className="text-xs text-gray-500 flex items-center gap-0.5">
-              <Clock size={10} /> {task.estimatedMinutes} min
-            </span>
-            {task.hasLocation && (
-              <span className="text-xs text-gray-500 flex items-center gap-0.5">
-                <MapPin size={10} /> {task.location} (+{task.travelMinutesBefore ?? 20} min traslado)
-              </span>
-            )}
-            {task.urgent && (
-              <span className="text-xs text-red-400 flex items-center gap-0.5">
-                <AlertCircle size={10} /> Urgente
-              </span>
-            )}
-          </div>
-          {subtasks && subtasks.length > 0 && (
-            <div className="mt-2 space-y-0.5">
-              {subtasks.map((s, i) => (
-                <p key={i} className="text-xs text-gray-400 pl-2 border-l border-white/10">
-                  {s.title} ({s.estimatedMinutes} min)
-                </p>
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="flex gap-1 flex-shrink-0">
-          <button
-            onClick={onAccept}
-            className="p-1.5 rounded-lg bg-green-500/15 hover:bg-green-500/25 text-green-400 transition-colors"
-          >
-            <CheckCircle2 size={14} />
-          </button>
-          <button
-            onClick={onReject}
-            className="p-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 transition-colors"
-          >
-            <X size={14} />
-          </button>
-        </div>
-      </div>
+    <div
+      className="fixed top-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-xl text-sm font-medium shadow-lg animate-slide-up"
+      style={{
+        background: type === "success" ? "rgba(35,14,255,0.9)" : "rgba(220,38,38,0.9)",
+        color: "#EAEBEF",
+        border: "1px solid rgba(255,255,255,0.1)",
+        backdropFilter: "blur(12px)",
+      }}
+    >
+      {msg}
     </div>
   );
 }
 
 export default function ChatPage() {
-  return (
-    <Suspense fallback={null}>
-      <ChatPageInner />
-    </Suspense>
-  );
-}
-
-function ChatPageInner() {
-  const searchParams = useSearchParams();
   const [state, setState] = useState<SOPState | null>(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [pendingTasks, setPendingTasks] = useState<
-    Map<string, { task: ParsedTaskOutput["tasks"][0]; subtasks: ParsedTaskOutput["subtasks"][string]; msgId: string }>
-  >(new Map());
+  const [toast, setToast] = useState<{ msg: string; type: "success" | "error" } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const autoSentRef = useRef(false);
 
-  useEffect(() => {
-    setState(loadState());
-  }, []);
+  useEffect(() => { setState(loadState()); }, []);
 
-  // Auto-send message from ?q= query param (quick capture from dashboard)
   useEffect(() => {
-    const q = searchParams.get("q");
-    if (q && state && !autoSentRef.current) {
+    if (!state || autoSentRef.current) return;
+    const q = new URLSearchParams(window.location.search).get("q");
+    if (q) {
       autoSentRef.current = true;
       setInput(q);
     }
-  }, [searchParams, state]);
+  }, [state]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [state?.chatMessages]);
 
-  const update = useCallback((s: SOPState) => {
-    setState(s);
-    saveState(s);
-  }, []);
+  const showToast = (msg: string, type: "success" | "error") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  const update = useCallback((s: SOPState) => { setState(s); saveState(s); }, []);
+
+  // ── Auto-create event from parsed task (no confirmation) ─────────────────
+  const autoCreateEvents = useCallback(
+    async (parsedTasks: ParsedTaskOutput, currentState: SOPState): Promise<SOPState> => {
+      const today = getTodayStr();
+      let st = currentState;
+      const allNewBlocks: TimeBlock[] = [];
+
+      for (const taskData of parsedTasks.tasks) {
+        const taskId = generateId();
+        const now = new Date().toISOString();
+
+        const newTask: Task = {
+          ...taskData,
+          id: taskId,
+          scheduledDate: taskData.scheduledDate ?? today,
+          missCount: 0,
+          gcalSyncStatus: "not_synced",
+          createdAt: now,
+          updatedAt: now,
+        } as Task;
+
+        const newSubtasks: Subtask[] = (parsedTasks.subtasks?.[String(parsedTasks.tasks.indexOf(taskData))] ?? []).map(
+          (s, i) => ({ ...s, id: generateId(), taskId, order: i })
+        );
+
+        const targetDate = newTask.scheduledDate ?? today;
+        const existing = st.timeBlocks.filter((b) => b.date === targetDate);
+        const { blocks } = scheduleDayTasks({
+          tasks: [newTask],
+          date: targetDate,
+          preferences: st.preferences,
+          existingBlocks: existing,
+        });
+
+        const blocksWithIds: TimeBlock[] = blocks.map((b) => ({ ...b, id: generateId() }));
+        allNewBlocks.push(...blocksWithIds);
+
+        st = {
+          ...st,
+          tasks: [...st.tasks, newTask],
+          subtasks: [...st.subtasks, ...newSubtasks],
+          timeBlocks: [...st.timeBlocks, ...blocksWithIds],
+        };
+      }
+
+      update(st);
+
+      // Push all new blocks to GCal
+      if (allNewBlocks.length > 0) {
+        const gcalIds = await pushBlocksToGCal(allNewBlocks);
+        if (gcalIds.size > 0) {
+          const synced = {
+            ...st,
+            timeBlocks: st.timeBlocks.map((b) => {
+              const gid = gcalIds.get(b.id);
+              return gid ? { ...b, gcalEventId: gid, gcalSyncStatus: "synced" as const } : b;
+            }),
+          };
+          update(synced);
+          return synced;
+        }
+      }
+
+      return st;
+    },
+    [update]
+  );
+
+  // ── Handle deletion ──────────────────────────────────────────────────────
+  const handleDeleteQuery = useCallback(
+    async (query: string, currentState: SOPState): Promise<SOPState> => {
+      const words = query.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
+      const matching = currentState.timeBlocks.filter((b) =>
+        words.some((w) => b.title.toLowerCase().includes(w))
+      );
+      if (matching.length === 0) return currentState;
+
+      for (const block of matching) {
+        if (block.gcalEventId) await deleteFromGCal(block.gcalEventId);
+      }
+
+      const deletedIds = new Set(matching.map((b) => b.id));
+      const deletedTaskIds = new Set(matching.map((b) => b.taskId).filter(Boolean) as string[]);
+
+      return {
+        ...currentState,
+        timeBlocks: currentState.timeBlocks.filter((b) => !deletedIds.has(b.id)),
+        tasks: currentState.tasks.filter((t) => !deletedTaskIds.has(t.id)),
+      };
+    },
+    []
+  );
 
   const sendMessage = async () => {
     if (!input.trim() || loading || !state) return;
 
     const userMsg: ChatMessage = {
-      id: generateId(),
-      role: "user",
-      content: input.trim(),
+      id: generateId(), role: "user", content: input.trim(),
       timestamp: new Date().toISOString(),
     };
 
-    const newState = {
-      ...state,
-      chatMessages: [...state.chatMessages, userMsg],
-    };
-    update(newState);
+    let currentState = { ...state, chatMessages: [...state.chatMessages, userMsg] };
+    update(currentState);
+    const sentText = input.trim();
     setInput("");
     setLoading(true);
 
@@ -148,161 +197,101 @@ function ChatPageInner() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: input.trim(),
-          history: state.chatMessages.slice(-10).map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
+          message: sentText,
+          history: state.chatMessages.slice(-8).map((m) => ({ role: m.role, content: m.content })),
           currentDate: getTodayStr(),
           currentTime: now.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" }),
         }),
       });
 
       const data = await res.json();
-      const { reply, parsedTasks } = data;
+
+      if (!res.ok || data.error) {
+        throw new Error(data.error ?? "Error del servidor");
+      }
+
+      const { reply, action, deleteQuery, parsedTasks } = data;
+      const replyText = reply || (action === "add" ? "Listo, lo agregué a tu calendario." : "Hecho.");
+
+      // ── Handle deletion ──────────────────────────────────────────────
+      if (action === "delete" && deleteQuery) {
+        currentState = await handleDeleteQuery(deleteQuery, currentState);
+        showToast("Evento eliminado del calendario", "success");
+      }
+
+      // ── Auto-create events ───────────────────────────────────────────
+      if (action === "add" && parsedTasks?.tasks?.length > 0) {
+        currentState = await autoCreateEvents(parsedTasks, currentState);
+        showToast("Evento agregado al calendario ✓", "success");
+      }
 
       const assistantMsg: ChatMessage = {
-        id: generateId(),
-        role: "assistant",
-        content: reply,
+        id: generateId(), role: "assistant", content: replyText,
         timestamp: new Date().toISOString(),
-        parsedTasks: parsedTasks?.tasks?.length > 0 ? parsedTasks : undefined,
       };
+      currentState = { ...currentState, chatMessages: [...currentState.chatMessages, assistantMsg] };
+      update(currentState);
 
-      const updatedState = {
-        ...newState,
-        chatMessages: [...newState.chatMessages, assistantMsg],
-      };
-      update(updatedState);
-
-      // Queue pending tasks for user review
-      if (parsedTasks?.tasks?.length > 0) {
-        const newPending = new Map(pendingTasks);
-        parsedTasks.tasks.forEach((task: ParsedTaskOutput["tasks"][0], i: number) => {
-          const key = `${assistantMsg.id}_${i}`;
-          newPending.set(key, {
-            task,
-            subtasks: parsedTasks.subtasks?.[String(i)] ?? [],
-            msgId: assistantMsg.id,
-          });
-        });
-        setPendingTasks(newPending);
-      }
-    } catch {
+    } catch (err) {
+      const msg = err instanceof Error && err.message.includes("API")
+        ? "Falta configurar la API key de Claude. Agrega ANTHROPIC_API_KEY en Vercel."
+        : "Error al procesar. Intenta de nuevo.";
       const errMsg: ChatMessage = {
-        id: generateId(),
-        role: "assistant",
-        content: "Lo siento, tuve un error. Asegúrate de tener ANTHROPIC_API_KEY configurado.",
+        id: generateId(), role: "assistant", content: msg,
         timestamp: new Date().toISOString(),
       };
-      update({ ...newState, chatMessages: [...newState.chatMessages, errMsg] });
+      update({ ...currentState, chatMessages: [...currentState.chatMessages, errMsg] });
+      showToast(msg, "error");
     } finally {
       setLoading(false);
     }
   };
 
-  const acceptTask = useCallback(
-    (key: string) => {
-      if (!state) return;
-      const pending = pendingTasks.get(key);
-      if (!pending) return;
-
-      const today = getTodayStr();
-      const taskId = generateId();
-      const now = new Date().toISOString();
-
-      const newTask: Task = {
-        ...pending.task,
-        id: taskId,
-        scheduledDate: pending.task.scheduledDate ?? today,
-        missCount: 0,
-        gcalSyncStatus: "not_synced",
-        createdAt: now,
-        updatedAt: now,
-      } as Task;
-
-      const newSubtasks: Subtask[] = (pending.subtasks ?? []).map((s, i) => ({
-        ...s,
-        id: generateId(),
-        taskId,
-        order: i,
-      }));
-
-      // Auto-schedule
-      const existingForDate = state.timeBlocks.filter(
-        (b) => b.date === (newTask.scheduledDate ?? today)
-      );
-      const { blocks } = scheduleDayTasks({
-        tasks: [newTask],
-        date: newTask.scheduledDate ?? today,
-        preferences: state.preferences,
-        existingBlocks: existingForDate,
-      });
-
-      const blocksWithIds = blocks.map((b) => ({ ...b, id: generateId() }));
-
-      const newPending = new Map(pendingTasks);
-      newPending.delete(key);
-      setPendingTasks(newPending);
-
-      update({
-        ...state,
-        tasks: [...state.tasks, newTask],
-        subtasks: [...state.subtasks, ...newSubtasks],
-        timeBlocks: [...state.timeBlocks, ...blocksWithIds],
-      });
-    },
-    [state, pendingTasks, update]
-  );
-
-  const rejectTask = useCallback(
-    (key: string) => {
-      const newPending = new Map(pendingTasks);
-      newPending.delete(key);
-      setPendingTasks(newPending);
-    },
-    [pendingTasks]
-  );
-
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   };
 
   if (!state) return null;
 
-  const STARTER_PROMPTS = [
-    "Necesito grabar 2 reels hoy y responder DMs",
-    "Tengo reunión con cliente a las 3pm en la oficina",
-    "Quiero hacer ejercicio 3 veces esta semana",
-    "Debo terminar la propuesta antes del viernes",
+  const STARTERS = [
+    "Agrega reunión de equipo mañana a las 10am, 1 hora",
+    "Pon gym esta tarde a las 7pm",
+    "Agrega almuerzo con cliente el viernes a las 1pm",
+    "Quita la reunión de las 3pm de hoy",
   ];
 
   return (
-    <div className="min-h-screen flex flex-col pb-20 md:pb-0 md:pt-14">
+    <div className="min-h-screen flex flex-col pb-20 md:pb-0 md:pt-14 proximity-gradient">
+      {toast && <Toast msg={toast.msg} type={toast.type} />}
       <Nav />
 
-      {/* Chat area */}
-      <div className="flex-1 max-w-3xl mx-auto w-full px-4 py-4 flex flex-col">
+      <div className="flex-1 max-w-2xl mx-auto w-full px-4 py-4 flex flex-col">
         <div className="flex-1 overflow-y-auto space-y-4 pb-4">
-          {/* Welcome */}
+
+          {/* Empty state */}
           {state.chatMessages.length === 0 && (
-            <div className="text-center py-12">
-              <div className="w-16 h-16 bg-indigo-500/10 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                <Zap size={32} className="text-indigo-400" />
+            <div className="text-center py-14">
+              <div
+                className="w-14 h-14 rounded-2xl flex items-center justify-center mx-auto mb-5"
+                style={{ background: "rgba(35,14,255,0.15)", border: "1px solid rgba(35,14,255,0.3)" }}
+              >
+                <MessageSquare size={26} style={{ color: "#230EFF" }} />
               </div>
-              <h2 className="text-xl font-bold text-white mb-2">SOP está listo</h2>
-              <p className="text-gray-400 text-sm mb-6">
-                Cuéntame qué necesitas hacer. Convertiré todo en acciones agendadas automáticamente.
+              <h2 className="text-xl font-bold mb-2" style={{ color: "#EAEBEF" }}>¿Qué quieres agendar?</h2>
+              <p className="text-sm mb-7 max-w-xs mx-auto" style={{ color: "#818BA6" }}>
+                Dime qué agregar o quitar y lo sincronizo con Google Calendar.
               </p>
-              <div className="grid grid-cols-1 gap-2 max-w-sm mx-auto">
-                {STARTER_PROMPTS.map((p) => (
+              <div className="space-y-2 max-w-sm mx-auto text-left">
+                {STARTERS.map((p) => (
                   <button
                     key={p}
                     onClick={() => setInput(p)}
-                    className="text-left text-sm glass rounded-xl px-4 py-2.5 text-gray-300 hover:text-white hover:border-white/20 transition-colors"
+                    className="w-full text-left text-sm px-4 py-3 rounded-xl transition-all hover:border-opacity-50"
+                    style={{
+                      background: "rgba(13,16,53,0.8)",
+                      border: "1px solid rgba(35,14,255,0.2)",
+                      color: "#818BA6",
+                    }}
                   >
                     {p}
                   </button>
@@ -314,47 +303,41 @@ function ChatPageInner() {
           {/* Messages */}
           {state.chatMessages.map((msg) => {
             const isUser = msg.role === "user";
-            // Find pending tasks for this message
-            const msgPending = [...pendingTasks.entries()].filter(
-              ([, v]) => v.msgId === msg.id
-            );
-
             return (
               <div key={msg.id} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-                <div className={`max-w-[85%] ${isUser ? "order-1" : ""}`}>
+                <div className="max-w-[85%]">
                   {!isUser && (
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <div className="w-5 h-5 bg-indigo-600 rounded flex items-center justify-center">
-                        <span className="text-xs font-bold text-white">S</span>
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <div
+                        className="w-5 h-5 rounded flex items-center justify-center text-xs font-black"
+                        style={{ background: "#230EFF", color: "#EAEBEF" }}
+                      >
+                        S
                       </div>
-                      <span className="text-xs text-gray-500">SOP</span>
+                      <span className="text-xs" style={{ color: "#3D4466" }}>SOP</span>
                     </div>
                   )}
                   <div
-                    className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                      isUser
-                        ? "bg-indigo-600 text-white rounded-tr-sm"
-                        : "glass text-gray-200 rounded-tl-sm"
-                    }`}
+                    className="rounded-2xl px-4 py-2.5 text-sm leading-relaxed"
+                    style={isUser ? {
+                      background: "#230EFF",
+                      color: "#EAEBEF",
+                      borderRadius: "16px 16px 4px 16px",
+                    } : {
+                      background: "rgba(13,16,53,0.9)",
+                      border: "1px solid rgba(35,14,255,0.2)",
+                      color: "#EAEBEF",
+                      borderRadius: "4px 16px 16px 16px",
+                    }}
                   >
                     {msg.content}
                   </div>
 
-                  {/* Pending tasks for this message */}
-                  {msgPending.length > 0 && (
-                    <div className="mt-2 space-y-2">
-                      <p className="text-xs text-gray-500 px-1">
-                        {msgPending.length} tarea{msgPending.length > 1 ? "s" : ""} detectada{msgPending.length > 1 ? "s" : ""}. ¿Las agendo?
-                      </p>
-                      {msgPending.map(([key, { task, subtasks }]) => (
-                        <PendingTaskCard
-                          key={key}
-                          task={task}
-                          subtasks={subtasks}
-                          onAccept={() => acceptTask(key)}
-                          onReject={() => rejectTask(key)}
-                        />
-                      ))}
+                  {/* GCal sync indicator */}
+                  {!isUser && msg.content.includes("calendario") && (
+                    <div className="flex items-center gap-1.5 mt-1.5 px-1">
+                      <Calendar size={11} style={{ color: "#230EFF" }} />
+                      <span className="text-xs" style={{ color: "#3D4466" }}>Sincronizado con Google Calendar</span>
                     </div>
                   )}
                 </div>
@@ -365,8 +348,11 @@ function ChatPageInner() {
           {/* Loading */}
           {loading && (
             <div className="flex justify-start">
-              <div className="glass rounded-2xl rounded-tl-sm px-4 py-3">
-                <Loader2 size={16} className="text-indigo-400 animate-spin" />
+              <div
+                className="rounded-2xl px-4 py-3"
+                style={{ background: "rgba(13,16,53,0.9)", border: "1px solid rgba(35,14,255,0.2)", borderRadius: "4px 16px 16px 16px" }}
+              >
+                <Loader2 size={15} className="animate-spin" style={{ color: "#230EFF" }} />
               </div>
             </div>
           )}
@@ -375,16 +361,19 @@ function ChatPageInner() {
         </div>
 
         {/* Input */}
-        <div className="glass rounded-2xl p-3 flex items-end gap-2">
+        <div
+          className="rounded-2xl p-3 flex items-end gap-2"
+          style={{ background: "rgba(13,16,53,0.9)", border: "1px solid rgba(35,14,255,0.25)" }}
+        >
           <textarea
             ref={inputRef}
-            className="flex-1 bg-transparent text-white placeholder-gray-500 text-sm resize-none focus:outline-none max-h-32 min-h-[40px]"
-            placeholder="¿Qué necesitas hacer hoy? (Enter para enviar)"
+            className="flex-1 bg-transparent text-sm resize-none focus:outline-none max-h-32 min-h-[40px]"
+            style={{ color: "#EAEBEF" }}
+            placeholder="Agregar o quitar del calendario…"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             rows={1}
-            style={{ height: "auto" }}
             onInput={(e) => {
               const t = e.currentTarget;
               t.style.height = "auto";
@@ -394,9 +383,10 @@ function ChatPageInner() {
           <button
             onClick={sendMessage}
             disabled={!input.trim() || loading}
-            className="flex-shrink-0 w-9 h-9 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl flex items-center justify-center transition-colors"
+            className="flex-shrink-0 w-9 h-9 rounded-xl flex items-center justify-center transition-all active:scale-95 disabled:opacity-40"
+            style={{ background: "#230EFF" }}
           >
-            <Send size={15} className="text-white" />
+            <Send size={14} style={{ color: "#EAEBEF" }} />
           </button>
         </div>
       </div>
