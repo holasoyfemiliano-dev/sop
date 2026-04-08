@@ -1,5 +1,6 @@
 "use client";
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 import Nav from "@/components/Nav";
 import { loadState, saveState, generateId, getTodayStr } from "@/lib/store";
 import { scheduleDayTasks } from "@/lib/scheduler";
@@ -82,6 +83,15 @@ function PendingTaskCard({
 }
 
 export default function ChatPage() {
+  return (
+    <Suspense fallback={null}>
+      <ChatPageInner />
+    </Suspense>
+  );
+}
+
+function ChatPageInner() {
+  const searchParams = useSearchParams();
   const [state, setState] = useState<SOPState | null>(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -90,10 +100,20 @@ export default function ChatPage() {
   >(new Map());
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const autoSentRef = useRef(false);
 
   useEffect(() => {
     setState(loadState());
   }, []);
+
+  // Auto-send message from ?q= query param (quick capture from dashboard)
+  useEffect(() => {
+    const q = searchParams.get("q");
+    if (q && state && !autoSentRef.current) {
+      autoSentRef.current = true;
+      setInput(q);
+    }
+  }, [searchParams, state]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
